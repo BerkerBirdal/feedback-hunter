@@ -20,8 +20,8 @@ SAMPLE_RATE_DEFAULT  = 48000
 BG_AVG_TIME_CONST    = 3.0
 DETECT_RATIO_DB      = 6.0
 PERSIST_FRAMES       = 4
-MAX_NOTCHES_PER_CH   = 3
-NOTCH_Q              = 25.0
+MAX_NOTCHES_PER_CH   = 24   # kanal başına maksimum notch — ses karakteri değişmez
+NOTCH_Q              = 80.0  # çok dar bant — sadece feedback frekansını keser
 RELEASE_FRAMES       = 30
 
 RECORD_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
