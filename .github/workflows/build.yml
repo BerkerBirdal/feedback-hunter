@@ -1,0 +1,78 @@
+name: Build Feedback Hunter
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install sounddevice numpy scipy pyinstaller
+
+      - name: Build exe
+        run: |
+          pyinstaller --onefile --windowed --name FeedbackHunter `
+            --hidden-import sounddevice `
+            --hidden-import scipy.signal `
+            --hidden-import scipy.io.wavfile `
+            feedback_killer.py
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: feedback_hunter_windows
+          path: dist/FeedbackHunter.exe
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install sounddevice numpy scipy pyinstaller
+
+      - name: Build .app
+        run: |
+          pyinstaller --windowed --name "Feedback Hunter" \
+            --hidden-import sounddevice \
+            --hidden-import scipy.signal \
+            --hidden-import scipy.io.wavfile \
+            --osx-bundle-identifier com.berkerbirdal.feedbackhunter \
+            feedback_killer.py
+
+      - name: Create DMG
+        run: |
+          brew install create-dmg || true
+          create-dmg \
+            --volname "Feedback Hunter" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --app-drop-link 400 185 \
+            "feedback_hunter_macos.dmg" \
+            "dist/Feedback Hunter.app" || \
+          hdiutil create -volname "Feedback Hunter" \
+            -srcfolder "dist/Feedback Hunter.app" \
+            -ov -format UDZO \
+            feedback_hunter_macos.dmg
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: feedback_hunter_macos
+          path: feedback_hunter_macos.dmg
