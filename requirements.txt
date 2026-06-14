@@ -1,3 +1,4 @@
 sounddevice
 numpy
 scipy
+imageio-ffmpeg

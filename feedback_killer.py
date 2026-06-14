@@ -1,19 +1,24 @@
 """
-Feedback Hunter v0.1 — Anti-Feedback / Anti-Reverb Aracı
+Feedback Hunter v0.3 — Anti-Feedback / Anti-Reverb Aracı
 =========================================================
 Başlatılmadan önce license_check.require_login() çağrılır.
+
+YENİ (v0.3): Boşta Öğrenme — program canlı ses işlemediğinde seçilen
+klasördeki ses/video dosyalarını düşük CPU önceliğiyle tarar, feedback
+imzalı (dar bantlı, uzun süreli) tonları tespit edip mekan profiline
+(venue_profile.json) ekler. Canlı işlem başlayınca anında duraklar.
 """
 
 from license_check import require_login
 require_login()
 
-import os, json, time, threading, datetime
+import os, json, time, threading, datetime, subprocess, shutil
 import numpy as np
 import scipy.signal as sig
 import scipy.io.wavfile as wavfile
 import sounddevice as sd
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 BLOCK_SIZE           = 1024
 SAMPLE_RATE_DEFAULT  = 48000
@@ -31,6 +36,20 @@ PROFILE_BUCKET_HZ        = 50.0
 PROFILE_MAX_BONUS_DB     = 3.0
 PROFILE_HITS_FOR_MAX_BONUS = 50
 
+# ── Boşta Öğrenme (Idle Learning) ─────────────────────────────────────────────
+LEARN_LEDGER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "learned_files.json")
+LEARN_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "learn_config.json")
+LEARN_AUDIO_EXT   = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".aiff", ".aif", ".opus", ".wma"}
+LEARN_VIDEO_EXT   = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".flv", ".wmv", ".mpg", ".mpeg"}
+LEARN_BLOCK       = 4096    # offline analiz blok boyutu (büyük = az iş, ≈85ms @48k)
+LEARN_TARGET_SR   = 48000   # çözümleme örnekleme hızı
+LEARN_THROTTLE    = 3.0     # her blok sonrası dinlenme oranı (≈%25 çekirdek)
+LEARN_PROMINENCE_DB = 10.0  # bin, yerel spektral zarftan bu kadar yüksekse dar tepe
+LEARN_ENV_KERNEL  = 21      # yerel zarf için ortalama penceresi (bin)
+LEARN_PERSIST     = 6       # tepe bu kadar ardışık blok (≈0.5 sn) sabit kalmalı — vibrato/perküsyonu eler
+LEARN_COOLDOWN    = 24      # aynı frekansı tekrar saymadan önce bekle
+LEARN_MAX_PER_FILE = 10     # tek dosya profili en fazla bu kadar farklı frekansla besler (taşma koruması)
+
 
 def load_venue_profile():
     try:
@@ -38,12 +57,291 @@ def load_venue_profile():
     except Exception: return {}
 
 def save_venue_profile(profile):
+    """Diske yazarken mevcut profille birleştirir (max) — boşta öğrenme ile
+    canlı oturum birbirinin verisini ezmesin."""
     try:
-        with open(PROFILE_PATH, "w") as f: json.dump(profile, f, indent=2, sort_keys=True)
+        existing = load_venue_profile()
+        merged = dict(existing)
+        for k, v in profile.items():
+            merged[k] = max(int(merged.get(k, 0)), int(v))
+        with open(PROFILE_PATH, "w") as f:
+            json.dump(merged, f, indent=2, sort_keys=True)
     except Exception: pass
 
 def freq_bucket(freq):
     return str(int(round(freq / PROFILE_BUCKET_HZ) * PROFILE_BUCKET_HZ))
+
+
+# ── Ses/Video çözümleme (ffmpeg varsa her formatı, yoksa sadece WAV) ──────────
+def _ffmpeg_exe():
+    """Sistemde ffmpeg ara; yoksa imageio-ffmpeg'in getirdiği binary'i kullan."""
+    p = shutil.which("ffmpeg")
+    if p:
+        return p
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+def ffmpeg_available():
+    return _ffmpeg_exe() is not None
+
+def decode_audio_mono(path, target_sr=LEARN_TARGET_SR):
+    """Dosyayı mono float32 sinyale çevirir. (sr, ndarray) veya (None, None)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".wav":
+        try:
+            sr, data = wavfile.read(path)
+            data = data.astype(np.float64)
+            if data.ndim > 1:
+                data = data.mean(axis=1)
+            peak = float(np.max(np.abs(data))) if data.size else 1.0
+            if peak > 1.5:           # tamsayı PCM → normalize
+                data = data / peak
+            return sr, data.astype(np.float32)
+        except Exception:
+            pass
+    ff = _ffmpeg_exe()
+    if not ff:
+        return None, None
+    try:
+        cmd = [ff, "-v", "quiet", "-i", path, "-ac", "1",
+               "-ar", str(target_sr), "-f", "f32le", "-"]
+        out = subprocess.run(cmd, capture_output=True, timeout=180)
+        if out.returncode != 0 or not out.stdout:
+            return None, None
+        arr = np.frombuffer(out.stdout, dtype=np.float32).copy()
+        return target_sr, arr
+    except Exception:
+        return None, None
+
+
+class IdleLearner:
+    """Boşta çalışan, düşük öncelikli feedback-öğrenme motoru.
+
+    - Canlı ses işlenirken pause() ile anında durur (CPU'yu canlıya bırakır).
+    - Her blok sonrası throttle uygulayarak ~%25 çekirdek kullanır.
+    - venue_profile.json'a yalnızca feedback imzalı (dar + uzun süreli) tonları ekler.
+    """
+
+    def __init__(self, status_cb=None):
+        self.profile     = load_venue_profile()
+        self.status_cb   = status_cb
+        self.enabled     = False
+        self.library_dir = None
+        self.throttle    = LEARN_THROTTLE
+        self.learned_total = 0
+        self.ledger      = self._load_ledger()
+        self._paused     = False
+        self._stop       = False
+        self._thread     = None
+        self._status_txt = "Beklemede"
+        self._load_config()
+
+    # ---- config / ledger ----
+    def _load_config(self):
+        try:
+            with open(LEARN_CONFIG_PATH) as f:
+                c = json.load(f)
+            self.library_dir = c.get("library_dir")
+            self.enabled     = bool(c.get("enabled", False))
+        except Exception:
+            pass
+
+    def _save_config(self):
+        try:
+            with open(LEARN_CONFIG_PATH, "w") as f:
+                json.dump({"library_dir": self.library_dir,
+                           "enabled": self.enabled}, f, indent=2)
+        except Exception: pass
+
+    def _load_ledger(self):
+        try:
+            with open(LEARN_LEDGER_PATH) as f: return json.load(f)
+        except Exception: return {}
+
+    def _save_ledger(self):
+        try:
+            with open(LEARN_LEDGER_PATH, "w") as f:
+                json.dump(self.ledger, f, indent=2)
+        except Exception: pass
+
+    # ---- yaşam döngüsü ----
+    def configure(self, library_dir, enabled):
+        self.library_dir = library_dir
+        self.enabled     = enabled
+        self._save_config()
+        if enabled:
+            self.start()
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop = False
+        self._thread = threading.Thread(target=self._worker, name="IdleLearner", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop = True
+
+    def pause(self):
+        self._paused = True
+        self._set_status("Canlı işlem aktif — öğrenme duraklatıldı")
+
+    def resume(self):
+        self._paused = False
+
+    def status_text(self):
+        return self._status_txt
+
+    def _set_status(self, txt):
+        self._status_txt = txt
+        if self.status_cb:
+            self.status_cb(txt)
+
+    def _should_continue(self):
+        return not self._stop and not self._paused and self.enabled
+
+    # ---- tarama ----
+    def _find_unscanned(self):
+        if not self.library_dir or not os.path.isdir(self.library_dir):
+            return []
+        found = []
+        for root, _, files in os.walk(self.library_dir):
+            for fn in files:
+                ext = os.path.splitext(fn)[1].lower()
+                if ext not in LEARN_AUDIO_EXT and ext not in LEARN_VIDEO_EXT:
+                    continue
+                p = os.path.join(root, fn)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                key = p
+                rec = self.ledger.get(key)
+                sig_ = f"{int(st.st_mtime)}:{st.st_size}"
+                if rec and rec.get("sig") == sig_:
+                    continue
+                found.append((p, sig_))
+        return found
+
+    def _mark_scanned(self, path, sig_, learned):
+        self.ledger[path] = {"sig": sig_, "learned": learned,
+                             "ts": datetime.datetime.now().isoformat(timespec="seconds")}
+        self._save_ledger()
+
+    def _refresh_profile(self):
+        """Diskteki profili (canlı oturumun eklemeleri dahil) içeri al."""
+        disk = load_venue_profile()
+        for k, v in disk.items():
+            self.profile[k] = max(int(self.profile.get(k, 0)), int(v))
+
+    def _worker(self):
+        # OS seviyesinde düşük öncelik (varsa)
+        try:
+            if hasattr(os, "nice"):
+                os.nice(15)
+        except Exception:
+            pass
+
+        while not self._stop:
+            if not self.enabled or self._paused or not self.library_dir:
+                time.sleep(2.0)
+                continue
+
+            batch = self._find_unscanned()
+            if not batch:
+                self._set_status(f"Güncel — toplam {self.learned_total} frekans öğrenildi")
+                time.sleep(15.0)
+                continue
+
+            for path, sig_ in batch:
+                if not self._should_continue():
+                    break
+                self._scan_one(path, sig_)
+                time.sleep(1.0)   # dosyalar arası dinlenme
+
+        self._set_status("Durduruldu")
+
+    def _scan_one(self, path, sig_):
+        name = os.path.basename(path)
+        self._set_status(f"Taranıyor: {name}")
+        sr, data = decode_audio_mono(path)
+        if data is None or len(data) < LEARN_BLOCK:
+            ext = os.path.splitext(path)[1].lower()
+            if ext in LEARN_VIDEO_EXT and not ffmpeg_available():
+                self._set_status(f"Atlandı (ffmpeg yok): {name}")
+            else:
+                self._set_status(f"Atlandı: {name}")
+            self._mark_scanned(path, sig_, 0)
+            return
+
+        self._refresh_profile()
+        learned = self._analyze(data, sr)
+        self.learned_total += len(learned)
+        save_venue_profile(self.profile)
+        self._mark_scanned(path, sig_, len(learned))
+        self._set_status(f"{name}: {len(learned)} feedback frekansı öğrenildi "
+                         f"(toplam {self.learned_total})")
+
+    def _analyze(self, data, sr):
+        """Sinyali bloklayıp feedback imzalı tonları profile ekler.
+
+        Feedback imzası: yerel spektral zarftan belirgin yüksek (dar tepe) ve
+        ≈1 saniye boyunca AYNI binde sabit kalan ton. Bu kriter geniş bant
+        gürültüyü, kısa notaları ve vibratolu müzik tonlarını eler.
+        CPU'yu düşük tutmak için her blok sonrası throttle uygular.
+        """
+        n       = LEARN_BLOCK
+        window  = np.hanning(n)
+        env_k   = np.ones(LEARN_ENV_KERNEL) / LEARN_ENV_KERNEL
+        candidates = {}
+        active     = {}              # bin -> cooldown
+        learned    = set()
+        nblocks    = len(data) // n
+
+        for bi in range(nblocks):
+            if not self._should_continue():
+                break
+            t0    = time.perf_counter()
+            block = data[bi * n:(bi + 1) * n]
+            mag   = np.abs(np.fft.rfft(block * window))
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                env       = np.convolve(mag, env_k, mode="same")
+                prom_db   = 20 * np.log10((mag + 1e-9) / (env + 1e-9))
+
+            cand = np.where(prom_db > LEARN_PROMINENCE_DB)[0]
+            nc = {}
+            for b in cand:
+                b = int(b); nc[b] = candidates.get(b, 0) + 1
+            candidates = nc
+
+            for b, c in candidates.items():
+                if c >= LEARN_PERSIST and b not in active:
+                    freq = b * sr / n
+                    if freq < 60 or freq > sr / 2 - 100:
+                        continue
+                    if len(learned) >= LEARN_MAX_PER_FILE:
+                        continue   # dosya başına taşma koruması
+                    bucket = freq_bucket(freq)
+                    self.profile[bucket] = int(self.profile.get(bucket, 0)) + 1
+                    learned.add(round(freq))
+                    active[b] = LEARN_COOLDOWN
+
+            for b in list(active.keys()):
+                if b not in candidates:
+                    active[b] -= 1
+                    if active[b] <= 0:
+                        del active[b]
+
+            # CPU throttle — işlem süresinin katı kadar dinlen
+            dt = time.perf_counter() - t0
+            if self.throttle > 0:
+                time.sleep(min(dt * self.throttle, 0.2))
+
+        return learned
 
 
 class ChannelProcessor:
@@ -226,14 +524,55 @@ class AudioEngine:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Feedback Hunter v0.1")
-        self.geometry("560x600")
-        self.minsize(560, 600)
+        self.title("Feedback Hunter v0.3")
+        self.geometry("560x680")
+        self.minsize(560, 680)
         self.engine = self.in_device = self.out_device = None
         self.in_total = self.out_total = 0
+
+        # Boşta öğrenme motoru — uygulama açık kaldıkça çalışır
+        self._learn_lbls = []
+        self.learner = IdleLearner(status_cb=self._learn_status)
+        if self.learner.enabled and self.learner.library_dir:
+            self.learner.start()
+
         self.frame_device = DeviceFrame(self, self.on_device_chosen)
         self.frame_channels = self.frame_main = None
         self.frame_device.pack(fill="both", expand=True)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ---- Boşta öğrenme köprüsü ----
+    def _learn_status(self, txt):
+        """Thread'den güvenli — tkinter güncellemesini ana döngüye taşı."""
+        try:
+            self.after(0, lambda: self._apply_learn_status(txt))
+        except Exception:
+            pass
+
+    def _apply_learn_status(self, txt):
+        for lbl in list(self._learn_lbls):
+            try:
+                lbl.config(text=txt)
+            except Exception:
+                self._learn_lbls.remove(lbl)
+
+    def register_learn_label(self, lbl):
+        self._learn_lbls = [lbl]
+
+    def pause_learning(self):
+        self.learner.pause()
+
+    def resume_learning(self):
+        if self.learner.enabled:
+            self.learner.resume()
+
+    def _on_close(self):
+        try:
+            if self.engine and self.frame_main and self.frame_main.running:
+                self.engine.stop()
+            self.learner.stop()
+        finally:
+            self.destroy()
 
     def on_device_chosen(self, in_dev, out_dev, in_t, out_t):
         self.in_device = in_dev; self.out_device = out_dev
@@ -250,6 +589,7 @@ class App(tk.Tk):
         if self.engine and self.frame_main and self.frame_main.running: self.engine.stop()
         if self.frame_main: self.frame_main.pack_forget(); self.frame_main = None
         self.engine = None
+        self.resume_learning()   # boşa döndük — öğrenmeye devam
         self.frame_device = DeviceFrame(self, self.on_device_chosen)
         self.frame_device.pack(fill="both", expand=True)
 
@@ -270,6 +610,7 @@ class DeviceFrame(ttk.Frame):
     def __init__(self, master, on_chosen):
         super().__init__(master, padding=20)
         self.on_chosen = on_chosen
+        self.app = master
         ttk.Label(self, text="1) Ses Kartı Seçimi", font=("", 14, "bold")).pack(pady=(0, 5))
         self.in_devs  = self._list_devices(True)
         self.out_devs = self._list_devices(False)
@@ -289,6 +630,55 @@ class DeviceFrame(ttk.Frame):
         ttk.Button(self, text="Devam", command=self._go).pack(pady=15)
         if not self.in_devs or not self.out_devs:
             ttk.Label(self, text="Giriş veya çıkış cihazı bulunamadı.", foreground="red").pack()
+
+        self._build_learn_panel()
+
+    def _build_learn_panel(self):
+        learner = self.app.learner
+        ttk.Separator(self, orient="horizontal").pack(fill="x", pady=(14, 10))
+        ttk.Label(self, text="🧠 Boşta Öğrenme", font=("", 12, "bold")).pack(anchor="w")
+        note = ("Program boştayken seçtiğiniz klasördeki ses/video dosyalarında "
+                "feedback (dar bantlı, sürekli ringing tonları) arar ve mekan "
+                "profiline ekler. CPU yükü minimumda tutulur; canlı işlem başlayınca "
+                "otomatik durur.\n"
+                "En iyi sonuç: feedback YAŞANMIŞ canlı kayıtlar / sahne kayıtları. "
+                "(Yoğun müzikte de bazı sürekli tonlar öğrenilebilir; etki sınırlıdır.)")
+        if not ffmpeg_available():
+            note += "\n⚠ Video/MP3 için 'ffmpeg' kurulu olmalı (yoksa sadece WAV taranır)."
+        ttk.Label(self, text=note, wraplength=500, foreground="gray",
+                  justify="left").pack(anchor="w", pady=(2, 8))
+
+        row = ttk.Frame(self); row.pack(fill="x")
+        self.learn_var = tk.BooleanVar(value=learner.enabled)
+        ttk.Checkbutton(row, text="Etkin", variable=self.learn_var,
+                        command=self._toggle_learn).pack(side="left")
+        ttk.Button(row, text="Klasör Seç…", command=self._pick_folder).pack(side="left", padx=10)
+
+        self.learn_dir_lbl = ttk.Label(
+            self, text=(learner.library_dir or "Klasör seçilmedi"),
+            foreground="gray", wraplength=500, justify="left")
+        self.learn_dir_lbl.pack(anchor="w", pady=(8, 0))
+
+        self.learn_status_lbl = ttk.Label(
+            self, text=learner.status_text(), foreground="#4f9cff",
+            wraplength=500, justify="left")
+        self.learn_status_lbl.pack(anchor="w", pady=(2, 0))
+        self.app.register_learn_label(self.learn_status_lbl)
+
+    def _pick_folder(self):
+        d = filedialog.askdirectory(title="Taranacak ses/video klasörü")
+        if d:
+            self.learn_dir_lbl.config(text=d)
+            self.app.learner.configure(d, self.learn_var.get())
+
+    def _toggle_learn(self):
+        enabled = self.learn_var.get()
+        d = self.app.learner.library_dir
+        if enabled and not d:
+            messagebox.showinfo("Klasör Gerekli", "Önce taranacak bir klasör seçin.")
+            self.learn_var.set(False)
+            return
+        self.app.learner.configure(d, enabled)
 
     def _list_devices(self, inp):
         res = []
@@ -387,17 +777,21 @@ class MainFrame(ttk.Frame):
     def _toggle(self):
         if not self.running:
             try:
+                self.app.pause_learning()   # canlı işlem — öğrenmeyi durdur
                 self.engine.start(); self.running = True
                 self.start_btn.config(text="DURDUR")
                 self.status_lbl.config(text="Durum: Çalışıyor...")
                 self._poll()
-            except Exception as e: messagebox.showerror("Hata", str(e))
+            except Exception as e:
+                self.app.resume_learning()
+                messagebox.showerror("Hata", str(e))
         else:
             self.engine.stop(); self.running = False
             self.start_btn.config(text="BAŞLAT")
             self.status_lbl.config(text="Durum: Durduruldu")
             for bar in (self.level_bar, self.out_bar): bar["value"] = 0
             for lbl in (self.level_lbl, self.out_lbl): lbl.config(text="-- dBFS")
+            self.app.resume_learning()      # boşta — öğrenmeye devam et
 
     def _poll(self):
         if not self.running: return
