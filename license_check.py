@@ -13,6 +13,7 @@ from tkinter import ttk
 SERVER_URL            = "https://fbhunter.berkerbirdal.com"
 CACHE_PATH            = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".fbhunter_auth")
 OFFLINE_GRACE_SECONDS = 7 * 24 * 3600  # 7 gün
+APP_VERSION           = "0.1.0"
 
 
 def _cache_key(username, password):
@@ -34,6 +35,49 @@ def _check_cache(username, password):
     if not data: return False
     if data.get("key") != _cache_key(username, password): return False
     return (time.time() - data.get("ts", 0)) < OFFLINE_GRACE_SECONDS
+
+def _check_remote_control():
+    """Sunucudan kill switch ve versiyon kontrolü. False dönerse uygulama kapanmalı."""
+    try:
+        url = f"{SERVER_URL}/api/version?v={APP_VERSION}"
+        req = urllib.request.Request(url, headers={"User-Agent": f"FeedbackHunter/{APP_VERSION}"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+
+        if not data.get("active", True):
+            msg = data.get("message") or "Bu yazılımın lisansı iptal edilmiştir.\n\nBilgi: bossproankara@gmail.com"
+            import tkinter.messagebox as mb
+            root = tk.Tk(); root.withdraw()
+            mb.showerror("Feedback Hunter — Lisans İptal", msg)
+            root.destroy()
+            return False
+
+        latest = data.get("latest_version", APP_VERSION)
+        force  = data.get("force_update", False)
+        if latest != APP_VERSION:
+            import tkinter.messagebox as mb
+            root = tk.Tk(); root.withdraw()
+            if force:
+                mb.showwarning(
+                    "Güncelleme Zorunlu",
+                    f"Feedback Hunter v{latest} güncelleme zorunludur.\n"
+                    f"Lütfen güncelleme yapın:\n{data.get('download_url', SERVER_URL)}"
+                )
+                root.destroy()
+                return False
+            else:
+                mb.showinfo(
+                    "Yeni Sürüm Mevcut",
+                    f"Feedback Hunter v{latest} yayında!\n"
+                    f"Güncellemek için: {data.get('download_url', SERVER_URL)}"
+                )
+            root.destroy()
+
+    except Exception:
+        pass  # Sunucuya ulaşılamazsa devam et (offline kullanım)
+
+    return True
+
 
 def _verify_online(username, password):
     try:
@@ -111,6 +155,8 @@ class LoginDialog(tk.Tk):
 
 
 def require_login():
+    if not _check_remote_control():
+        raise SystemExit(0)
     dlg = LoginDialog()
     dlg.mainloop()
     if not dlg.result:
