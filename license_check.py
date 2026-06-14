@@ -1,6 +1,9 @@
 """
 license_check.py — Feedback Hunter giriş ekranı.
 Açılışta fbhunter.berkerbirdal.com/api/auth ile doğrular.
+
+Copyright (c) 2026 Berker Birdal. Tüm hakları saklıdır. / All Rights Reserved.
+İzinsiz kopyalama, dağıtma ve değiştirme yasaktır. Bkz. LICENSE.
 """
 
 import os, json, time, hashlib, urllib.request, urllib.error
@@ -51,7 +54,7 @@ class LoginDialog(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Feedback Hunter - Giriş")
-        self.geometry("380x230")
+        self.geometry("380x260")
         self.resizable(False, False)
         self.result = False
 
@@ -78,6 +81,9 @@ class LoginDialog(tk.Tk):
         self.status_lbl = ttk.Label(self, text="", foreground="red",
                                     wraplength=340, justify="center")
         self.status_lbl.pack()
+
+        ttk.Label(self, text="© 2026 Berker Birdal — Tüm hakları saklıdır",
+                  font=("", 8), foreground="gray").pack(side="bottom", pady=(0, 6))
         self.bind("<Return>", lambda e: self._submit())
 
     def _submit(self):

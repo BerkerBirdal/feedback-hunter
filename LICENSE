@@ -1,0 +1,31 @@
+Feedback Hunter
+Copyright (c) 2026 Berker Birdal. Tüm hakları saklıdır. / All Rights Reserved.
+
+Bu yazılım ("Feedback Hunter") ve içerdiği tüm kaynak kod, tasarım, algoritma
+ve ilgili materyaller Berker Birdal'a aittir ve telif hakkı yasalarıyla
+korunmaktadır.
+
+İZİN VERİLMEYEN KULLANIM
+------------------------
+Berker Birdal'ın önceden yazılı açık izni olmaksızın bu yazılımın tamamının
+veya bir kısmının:
+  - kopyalanması, çoğaltılması, dağıtılması,
+  - değiştirilmesi, türev çalışma oluşturulması,
+  - kaynak koduna geri çevrilmesi (reverse engineering), decompile edilmesi,
+  - satılması, kiralanması, alt lisanslanması veya başka şekilde ticari
+    amaçla kullanılması
+KESİNLİKLE YASAKTIR.
+
+KULLANIM HAKKI
+--------------
+Yazılım, fbhunter.berkerbirdal.com üzerinden kayıt olup hesabı onaylanan
+kullanıcılara, yalnızca kişisel/kurumsal kullanım amacıyla, devredilemez ve
+münhasır olmayan bir kullanım hakkı (lisans) ile sunulur. Bu hak, Berker
+Birdal tarafından herhangi bir zamanda geri alınabilir.
+
+GARANTİ REDDİ
+-------------
+Yazılım "OLDUĞU GİBİ" sunulur; açık veya örtük hiçbir garanti verilmez.
+Yazılımın kullanımından doğan hiçbir zarardan Berker Birdal sorumlu tutulamaz.
+
+İletişim / İzin talepleri: berkerbirdal.com

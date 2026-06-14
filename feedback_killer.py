@@ -1,5 +1,8 @@
 """
-Feedback Hunter v0.3 — Anti-Feedback / Anti-Reverb Aracı
+Feedback Hunter — Anti-Feedback / Anti-Reverb Aracı
+====================================================
+Copyright (c) 2026 Berker Birdal. Tüm hakları saklıdır. / All Rights Reserved.
+İzinsiz kopyalama, dağıtma ve değiştirme yasaktır. Bkz. LICENSE.
 =========================================================
 Başlatılmadan önce license_check.require_login() çağrılır.
 
