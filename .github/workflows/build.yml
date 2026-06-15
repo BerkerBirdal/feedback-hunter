@@ -15,6 +15,17 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Inject version from tag
+        shell: python
+        run: |
+          import os, re
+          ver = os.environ.get("GITHUB_REF_NAME", "0.0.0").lstrip("v")
+          p = "license_check.py"
+          s = open(p, encoding="utf-8").read()
+          s = re.sub(r'APP_VERSION\s*=\s*"[^"]*"', f'APP_VERSION = "{ver}"', s)
+          open(p, "w", encoding="utf-8").write(s)
+          print("APP_VERSION =", ver)
+
       - name: Install dependencies
         run: |
           pip install sounddevice numpy scipy imageio-ffmpeg pyinstaller
@@ -42,6 +53,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      - name: Inject version from tag
+        shell: python
+        run: |
+          import os, re
+          ver = os.environ.get("GITHUB_REF_NAME", "0.0.0").lstrip("v")
+          p = "license_check.py"
+          s = open(p, encoding="utf-8").read()
+          s = re.sub(r'APP_VERSION\s*=\s*"[^"]*"', f'APP_VERSION = "{ver}"', s)
+          open(p, "w", encoding="utf-8").write(s)
+          print("APP_VERSION =", ver)
 
       - name: Install dependencies
         run: |

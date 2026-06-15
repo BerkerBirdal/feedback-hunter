@@ -53,7 +53,7 @@ def _check_remote_control():
             return False
 
         latest = data.get("latest_version", APP_VERSION)
-        force  = data.get("force_update", False)
+        force  = data.get("force_update", True)   # varsayılan: sürüm farkı ZORUNLU güncelleme
         if latest != APP_VERSION:
             import tkinter.messagebox as mb
             root = tk.Tk(); root.withdraw()
