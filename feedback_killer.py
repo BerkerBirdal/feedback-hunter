@@ -36,6 +36,13 @@ PROFILE_KNOWN_HITS   = 5      # bu kadar tespit görmüş frekans "bilinen feedb
 MAX_NOTCHES_PER_CH   = 24     # kanal başına maksimum notch — ses karakteri değişmez
 NOTCH_Q              = 80.0   # çok dar bant — sadece feedback frekansını keser
 LATCH_NOTCHES        = True   # kilitlenen notch kalıcı — feedback geri sızmaz
+# Frekans-kararlılık kapısı: feedback'i İNSAN SESİNDEN ayıran ASIL ölçüt.
+# Feedback frekansı kaya gibi sabittir; vokal/konuşma sürekli oynar (vibrato, pitch).
+# Sadece DAR-KARARLI tonlar feedback sayılır → vokale/konuşmacıya ASLA notch atılmaz (EQ yok).
+TRACK_MATCH_HZ       = 10.0   # tepe bu kadar yakınsa aynı "iz" (frekans takibi)
+TRACK_MISS_MAX       = 2      # iz bu kadar algılama koşusu görünmezse düşer
+STABILITY_HZ         = 3.0    # feedback frekansı pencere boyunca bu kadar dar kalmalı (taban)
+STABILITY_FRAC       = 0.004  # veya ±%0.4 (hangisi büyükse) — ses hareketi bunu kesin aşar
 
 RECORD_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
 PROFILE_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "venue_profile.json")
@@ -376,25 +383,20 @@ class ChannelProcessor:
         self.warmup  = max(1, self.n // self.io)
         # arka plan ortalaması algılama hızına göre (her DETECT_HOP blokta bir)
         self.alpha_bg = np.exp(-(self.io * DETECT_HOP) / (self.fs * BG_AVG_TIME_CONST))
-        # algılama, zamanı blok yerine "algılama koşusu" cinsinden say
+        # gereken süreklilik (algılama koşusu cinsinden)
         det_interval = (self.io * DETECT_HOP) / self.fs
-        self.persist_unknown = max(1, int(round((PERSIST_MS / 1000.0) / det_interval)))
-        self.persist_known   = max(1, int(round((PERSIST_MS_KNOWN / 1000.0) / det_interval)))
-        self.candidates     = {}
-        self.active_notches = {}   # bin -> {"freq","sos"}
-        self.notch_states   = {}   # bin -> sosfilt zi
+        self.persist_unknown = max(2, int(round((PERSIST_MS / 1000.0) / det_interval)))
+        self.persist_known   = max(2, int(round((PERSIST_MS_KNOWN / 1000.0) / det_interval)))
+        self.tracks         = []   # frekans izleri: {f,fmin,fmax,count,seen,miss}
+        self.active_notches = {}   # id -> {"freq","sos"}
+        self.notch_states   = {}   # id -> sosfilt zi
+        self._nid           = 0
         self.last_detected_freqs = []
-        # bin başına eşik ve gereken süreklilik (bilinen feedback frekansları hızlı + hassas)
-        n_bins = self.n // 2 + 1
-        self.threshold_db = np.full(n_bins, DETECT_RATIO_DB)
-        self.persist_req  = np.full(n_bins, self.persist_unknown, dtype=int)
-        for b in range(n_bins):
-            hits = self.profile.get(freq_bucket(self.freq_for_bin(b)), 0)
-            if hits >= PROFILE_KNOWN_HITS:
-                self.threshold_db[b] = DETECT_RATIO_DB_KNOWN
-                self.persist_req[b]  = self.persist_known
 
     def freq_for_bin(self, b): return b * self.fs / self.n
+
+    def _is_known(self, freq):
+        return self.profile.get(freq_bucket(freq), 0) >= PROFILE_KNOWN_HITS
 
     def _interp_bin(self, mag, b):
         """Parabolik (quadratic) interpolasyon — alt-bin tepe konumu."""
@@ -414,7 +416,11 @@ class ChannelProcessor:
 
     def _detect(self):
         """Geniş pencerede feedback ara (her DETECT_HOP blokta bir koşar).
-        Ses yoluna gecikme KATMAZ — sadece hangi notch'ların açılacağını belirler."""
+        Ses yoluna gecikme KATMAZ — sadece hangi notch'ların açılacağını belirler.
+
+        KRİTİK: Bir tepe ancak FREKANSI KARARLI kalırsa (feedback imzası) notch'lanır.
+        İnsan sesi (vibrato/pitch) sürekli oynadığı için iz genişler ve elenir →
+        vokale/konuşmacıya ASLA EQ/notch atılmaz."""
         mag = np.abs(np.fft.rfft(self.ring * self.window))
         if self.bg_mag is None:
             self.bg_mag = mag.copy() + 1e-6
@@ -422,31 +428,52 @@ class ChannelProcessor:
             self.bg_mag = self.alpha_bg * self.bg_mag + (1 - self.alpha_bg) * mag
         if self.fills < self.warmup:
             return
+
         with np.errstate(divide="ignore", invalid="ignore"):
             ratio_db     = 20 * np.log10((mag + 1e-9) / (self.bg_mag + 1e-9))
             smooth       = np.convolve(mag, np.ones(7) / 7.0, mode="same")
             sharpness_db = 20 * np.log10((mag + 1e-9) / (smooth + 1e-9))
-        above = (ratio_db > self.threshold_db) & (sharpness_db > 3.0)
-        # YEREL TEPE: tek feedback tonu için tek bin (yayılmayı engeller)
+        above = (ratio_db > DETECT_RATIO_DB) & (sharpness_db > 3.0)
         peak = np.zeros_like(above)
         peak[1:-1] = (mag[1:-1] >= mag[:-2]) & (mag[1:-1] > mag[2:])
-        cand_bins = np.where(above & peak)[0]
+        peaks = [self._interp_bin(mag, int(b)) * self.fs / self.n
+                 for b in np.where(above & peak)[0]]
 
-        new_cands = {}
-        for b in cand_bins:
-            new_cands[int(b)] = self.candidates.get(int(b), 0) + 1
-        self.candidates = new_cands
+        # --- frekans takibi: her tepeyi mevcut bir ize eşle ---
+        for tr in self.tracks:
+            tr["seen"] = False
+        for f in peaks:
+            best, bd = None, TRACK_MATCH_HZ
+            for tr in self.tracks:
+                d = abs(tr["f"] - f)
+                if d < bd:
+                    bd, best = d, tr
+            if best is not None:
+                best["seen"]  = True
+                best["count"] += 1
+                best["fmin"]   = min(best["fmin"], f)
+                best["fmax"]   = max(best["fmax"], f)
+                best["f"]      = 0.7 * best["f"] + 0.3 * f
+            else:
+                self.tracks.append({"f": f, "fmin": f, "fmax": f,
+                                    "count": 1, "seen": True, "miss": 0})
 
-        for b, cnt in self.candidates.items():
-            if cnt >= self.persist_req[b] and b not in self.active_notches:
-                if len(self.active_notches) >= MAX_NOTCHES_PER_CH:
-                    continue
-                freq = self._interp_bin(mag, b) * self.fs / self.n
-                if any(abs(i["freq"] - freq) < 25 for i in self.active_notches.values()):
-                    continue   # aynı bölgede notch var
-                self.active_notches[b] = {"freq": freq, "sos": self._design_notch_sos(freq)}
-                self.notch_states[b]   = None
+        # --- KARARLILIK KAPISI: yeterince sürmüş VE dar kalmış izleri notch'la ---
+        for tr in self.tracks:
+            tr["miss"] = 0 if tr["seen"] else tr["miss"] + 1
+            freq   = tr["f"]
+            need   = self.persist_known if self._is_known(freq) else self.persist_unknown
+            stab   = max(STABILITY_HZ, STABILITY_FRAC * freq)
+            if (tr["count"] >= need and (tr["fmax"] - tr["fmin"]) <= stab
+                    and len(self.active_notches) < MAX_NOTCHES_PER_CH
+                    and not any(abs(a["freq"] - freq) < 25 for a in self.active_notches.values())):
+                self.active_notches[self._nid] = {"freq": freq, "sos": self._design_notch_sos(freq)}
+                self.notch_states[self._nid]   = None
+                self._nid += 1
                 self.profile[freq_bucket(freq)] = self.profile.get(freq_bucket(freq), 0) + 1
+
+        # eski izleri at
+        self.tracks = [tr for tr in self.tracks if tr["miss"] <= TRACK_MISS_MAX]
 
     def process_block(self, x, wet):
         dry = x.copy()
@@ -484,7 +511,7 @@ class ChannelProcessor:
         """Latch'li notch'ları temizle (yeni mekan / manuel sıfırlama)."""
         self.active_notches.clear()
         self.notch_states.clear()
-        self.candidates.clear()
+        self.tracks.clear()
 
 
 class AudioEngine:
@@ -616,7 +643,7 @@ class AudioEngine:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Feedback Hunter v0.3")
+        self.title("Feedback Hunter")
         self.geometry("560x680")
         self.minsize(560, 680)
         self.engine = self.in_device = self.out_device = None
