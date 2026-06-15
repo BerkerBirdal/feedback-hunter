@@ -23,14 +23,19 @@ import sounddevice as sd
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-BLOCK_SIZE           = 1024
+BLOCK_SIZE           = 128    # I/O bloğu — MİNİMUM GECİKME (≈2.7 ms @48k). Seçilebilir.
+ANALYSIS_SIZE        = 1024   # algılama FFT penceresi — frekans çözünürlüğü (ses yoluna gecikme KATMAZ)
+DETECT_HOP           = 2      # algılamayı her N blokta koştur (CPU tasarrufu; notch her blok uygulanır)
 SAMPLE_RATE_DEFAULT  = 48000
 BG_AVG_TIME_CONST    = 3.0
-DETECT_RATIO_DB      = 6.0
-PERSIST_FRAMES       = 4
-MAX_NOTCHES_PER_CH   = 24   # kanal başına maksimum notch — ses karakteri değişmez
-NOTCH_Q              = 80.0  # çok dar bant — sadece feedback frekansını keser
-RELEASE_FRAMES       = 30
+DETECT_RATIO_DB      = 9.0    # bilinmeyen frekans eşiği (müzik-güvenli)
+DETECT_RATIO_DB_KNOWN = 6.0   # mekan profilindeki bilinen feedback frekansı (daha hassas)
+PERSIST_MS           = 120.0  # bilinmeyen ton bu süre sabit kalmalı → müziği eler
+PERSIST_MS_KNOWN     = 35.0   # bilinen feedback noktası → çok hızlı kilit
+PROFILE_KNOWN_HITS   = 5      # bu kadar tespit görmüş frekans "bilinen feedback" sayılır
+MAX_NOTCHES_PER_CH   = 24     # kanal başına maksimum notch — ses karakteri değişmez
+NOTCH_Q              = 80.0   # çok dar bant — sadece feedback frekansını keser
+LATCH_NOTCHES        = True   # kilitlenen notch kalıcı — feedback geri sızmaz
 
 RECORD_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
 PROFILE_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "venue_profile.json")
@@ -348,75 +353,143 @@ class IdleLearner:
 
 
 class ChannelProcessor:
-    def __init__(self, samplerate, block_size, profile=None):
-        self.fs, self.n = samplerate, block_size
+    """Düşük gecikmeli feedback bastırma.
+
+    Mimari: I/O bloğu küçük (BLOCK_SIZE, düşük gecikme) ama algılama ayrı bir
+    geniş pencerede (ANALYSIS_SIZE) yapılır. Bu sayede gecikme düşük kalırken
+    frekans çözünürlüğü korunur; parabolik interpolasyonla feedback frekansı
+    alt-bin hassasiyetinde bulunur → dar notch tam isabet eder.
+    Notch'lar IIR (sosfilt) olduğu için ses yoluna EK GECİKME KATMAZ.
+    """
+
+    def __init__(self, samplerate, io_block, analysis_size, profile=None):
+        self.fs   = samplerate
+        self.io   = io_block
+        self.n    = analysis_size
         self.window  = np.hanning(self.n)
         self.profile = profile or {}
+        self.ring    = np.zeros(self.n, dtype=np.float64)
         self.bg_mag  = None
-        self.alpha_bg = np.exp(-self.n / (self.fs * BG_AVG_TIME_CONST))
-        self.candidates   = {}
-        self.active_notches = {}
-        self.notch_states   = {}
+        self.fills   = 0
+        self.hopctr  = 0
+        # ring buffer dolana kadar algılama yok (yanlış tepe kilidini önler)
+        self.warmup  = max(1, self.n // self.io)
+        # arka plan ortalaması algılama hızına göre (her DETECT_HOP blokta bir)
+        self.alpha_bg = np.exp(-(self.io * DETECT_HOP) / (self.fs * BG_AVG_TIME_CONST))
+        # algılama, zamanı blok yerine "algılama koşusu" cinsinden say
+        det_interval = (self.io * DETECT_HOP) / self.fs
+        self.persist_unknown = max(1, int(round((PERSIST_MS / 1000.0) / det_interval)))
+        self.persist_known   = max(1, int(round((PERSIST_MS_KNOWN / 1000.0) / det_interval)))
+        self.candidates     = {}
+        self.active_notches = {}   # bin -> {"freq","sos"}
+        self.notch_states   = {}   # bin -> sosfilt zi
         self.last_detected_freqs = []
+        # bin başına eşik ve gereken süreklilik (bilinen feedback frekansları hızlı + hassas)
         n_bins = self.n // 2 + 1
         self.threshold_db = np.full(n_bins, DETECT_RATIO_DB)
+        self.persist_req  = np.full(n_bins, self.persist_unknown, dtype=int)
         for b in range(n_bins):
             hits = self.profile.get(freq_bucket(self.freq_for_bin(b)), 0)
-            if hits > 0:
-                bonus = min(PROFILE_MAX_BONUS_DB, hits / PROFILE_HITS_FOR_MAX_BONUS * PROFILE_MAX_BONUS_DB)
-                self.threshold_db[b] = DETECT_RATIO_DB - bonus
+            if hits >= PROFILE_KNOWN_HITS:
+                self.threshold_db[b] = DETECT_RATIO_DB_KNOWN
+                self.persist_req[b]  = self.persist_known
 
     def freq_for_bin(self, b): return b * self.fs / self.n
+
+    def _interp_bin(self, mag, b):
+        """Parabolik (quadratic) interpolasyon — alt-bin tepe konumu."""
+        if b <= 0 or b >= len(mag) - 1:
+            return float(b)
+        a = 20 * np.log10(mag[b - 1] + 1e-9)
+        m = 20 * np.log10(mag[b]     + 1e-9)
+        c = 20 * np.log10(mag[b + 1] + 1e-9)
+        denom = (a - 2 * m + c)
+        d = 0.5 * (a - c) / denom if denom != 0 else 0.0
+        return b + max(-0.5, min(0.5, d))
 
     def _design_notch_sos(self, freq):
         freq = max(20.0, min(freq, self.fs / 2 - 50))
         b, a = sig.iirnotch(freq / (self.fs / 2), NOTCH_Q)
         return sig.tf2sos(b, a)
 
-    def process_block(self, x, wet):
-        dry  = x.copy()
-        spec = np.fft.rfft(x * self.window)
-        mag  = np.abs(spec)
-        if self.bg_mag is None: self.bg_mag = mag.copy() + 1e-6
-        else: self.bg_mag = self.alpha_bg * self.bg_mag + (1 - self.alpha_bg) * mag
+    def _detect(self):
+        """Geniş pencerede feedback ara (her DETECT_HOP blokta bir koşar).
+        Ses yoluna gecikme KATMAZ — sadece hangi notch'ların açılacağını belirler."""
+        mag = np.abs(np.fft.rfft(self.ring * self.window))
+        if self.bg_mag is None:
+            self.bg_mag = mag.copy() + 1e-6
+        else:
+            self.bg_mag = self.alpha_bg * self.bg_mag + (1 - self.alpha_bg) * mag
+        if self.fills < self.warmup:
+            return
         with np.errstate(divide="ignore", invalid="ignore"):
-            ratio_db    = 20 * np.log10((mag + 1e-9) / (self.bg_mag + 1e-9))
-            smooth      = np.convolve(mag, np.ones(7) / 7.0, mode="same")
+            ratio_db     = 20 * np.log10((mag + 1e-9) / (self.bg_mag + 1e-9))
+            smooth       = np.convolve(mag, np.ones(7) / 7.0, mode="same")
             sharpness_db = 20 * np.log10((mag + 1e-9) / (smooth + 1e-9))
-        candidate_bins = np.where((ratio_db > self.threshold_db) & (sharpness_db > 3.0))[0]
+        above = (ratio_db > self.threshold_db) & (sharpness_db > 3.0)
+        # YEREL TEPE: tek feedback tonu için tek bin (yayılmayı engeller)
+        peak = np.zeros_like(above)
+        peak[1:-1] = (mag[1:-1] >= mag[:-2]) & (mag[1:-1] > mag[2:])
+        cand_bins = np.where(above & peak)[0]
+
         new_cands = {}
-        for b in candidate_bins: new_cands[int(b)] = self.candidates.get(int(b), 0) + 1
+        for b in cand_bins:
+            new_cands[int(b)] = self.candidates.get(int(b), 0) + 1
         self.candidates = new_cands
-        for b, cnt in list(self.candidates.items()):
-            if cnt >= PERSIST_FRAMES and b not in self.active_notches:
-                if len(self.active_notches) < MAX_NOTCHES_PER_CH:
-                    self.active_notches[b] = RELEASE_FRAMES
-                    self.notch_states[b]   = None
-                    bucket = freq_bucket(self.freq_for_bin(b))
-                    self.profile[bucket] = self.profile.get(bucket, 0) + 1
+
+        for b, cnt in self.candidates.items():
+            if cnt >= self.persist_req[b] and b not in self.active_notches:
+                if len(self.active_notches) >= MAX_NOTCHES_PER_CH:
+                    continue
+                freq = self._interp_bin(mag, b) * self.fs / self.n
+                if any(abs(i["freq"] - freq) < 25 for i in self.active_notches.values()):
+                    continue   # aynı bölgede notch var
+                self.active_notches[b] = {"freq": freq, "sos": self._design_notch_sos(freq)}
+                self.notch_states[b]   = None
+                self.profile[freq_bucket(freq)] = self.profile.get(freq_bucket(freq), 0) + 1
+
+    def process_block(self, x, wet):
+        dry = x.copy()
+        m   = len(x)
+
+        # --- ring buffer güncelle ---
+        if m >= self.n:
+            self.ring[:] = x[-self.n:]
+        else:
+            self.ring[:-m] = self.ring[m:]
+            self.ring[-m:] = x
+        self.fills += 1
+
+        # --- ALGILAMA (seyrek — her DETECT_HOP blokta, CPU için) ---
+        self.hopctr += 1
+        if self.hopctr >= DETECT_HOP:
+            self.hopctr = 0
+            self._detect()
+
+        # --- FİLTRELEME (HER blok — minimum gecikme, IIR sürekli, LATCH) ---
         y = dry.copy()
         active_freqs = []
-        for b, release in list(self.active_notches.items()):
-            freq = self.freq_for_bin(b)
-            active_freqs.append(round(freq, 1))
-            sos = self._design_notch_sos(freq)
+        for b, info in self.active_notches.items():
+            active_freqs.append(round(info["freq"], 1))
+            sos = info["sos"]
             if self.notch_states[b] is None:
                 zi = sig.sosfilt_zi(sos)
                 self.notch_states[b] = zi * y[0] if len(y) else zi
             y, self.notch_states[b] = sig.sosfilt(sos, y, zi=self.notch_states[b])
-            if b not in self.candidates:
-                release -= 1
-                self.active_notches[b] = release
-                if release <= 0:
-                    del self.active_notches[b]; del self.notch_states[b]
-            else:
-                self.active_notches[b] = RELEASE_FRAMES
+
         self.last_detected_freqs = active_freqs
         return (1.0 - wet) * dry + wet * y, active_freqs
 
+    def reset_notches(self):
+        """Latch'li notch'ları temizle (yeni mekan / manuel sıfırlama)."""
+        self.active_notches.clear()
+        self.notch_states.clear()
+        self.candidates.clear()
+
 
 class AudioEngine:
-    def __init__(self, in_device, out_device, channels_in_range, in_total, out_total, samplerate, status_cb):
+    def __init__(self, in_device, out_device, channels_in_range, in_total, out_total,
+                 samplerate, status_cb, block_size=BLOCK_SIZE):
         self.in_device  = in_device
         self.out_device = out_device
         self.start_ch, self.end_ch = channels_in_range
@@ -426,19 +499,28 @@ class AudioEngine:
         self.same_device = (in_device == out_device)
         self.fs         = samplerate
         self.status_cb  = status_cb
+        self.block_size = block_size
         self.wet        = 0.5
         self.recording_enabled = False
         self.input_level_db    = -100.0
         self.output_level_db   = -100.0
         self._rec_buffer = []; self._rec_freqs = set(); self._rec_active = False
         self.venue_profile = load_venue_profile()
-        self.processors = [ChannelProcessor(self.fs, BLOCK_SIZE, profile=self.venue_profile)
+        self.processors = [ChannelProcessor(self.fs, self.block_size, ANALYSIS_SIZE, profile=self.venue_profile)
                            for _ in range(self.n_channels)]
         self.stream = None
+        self.latency_ms = None     # akış başlayınca sürücüden okunur
         self._lock  = threading.Lock()
 
     def get_venue_profile_summary(self):
         return len(self.venue_profile), sum(self.venue_profile.values())
+
+    def get_latency_ms(self):
+        return self.latency_ms
+
+    def reset_notches(self):
+        for p in self.processors:
+            p.reset_notches()
 
     def get_level_db(self):
         with self._lock: return self.input_level_db
@@ -475,7 +557,7 @@ class AudioEngine:
         sel = indata[:, self.start_ch - 1:self.end_ch]
         rms = float(np.sqrt(np.mean(np.square(sel.astype(np.float64))) + 1e-12))
         with self._lock: self.input_level_db = 20.0 * np.log10(rms + 1e-12)
-        if indata.shape[0] != BLOCK_SIZE: return sel, []
+        if indata.shape[0] < 8: return sel, []   # ring buffer her blok boyutunu işler
         processed = np.empty_like(sel)
         all_freqs = []
         for i in range(self.n_channels):
@@ -492,7 +574,7 @@ class AudioEngine:
         with self._lock: wet = self.wet
         if self.same_device: outdata[:] = indata
         else: outdata[:] = 0.0
-        if indata.shape[0] != BLOCK_SIZE: return
+        if indata.shape[0] < 8: return
         processed, _ = self._process(indata, wet)
         if self.same_device: outdata[:, self.start_ch - 1:self.end_ch] = processed
         elif self.n_channels == self.out_total: outdata[:] = processed
@@ -508,15 +590,22 @@ class AudioEngine:
     def start(self):
         if self.same_device:
             self.stream = sd.Stream(device=(self.in_device, self.out_device),
-                samplerate=self.fs, blocksize=BLOCK_SIZE,
+                samplerate=self.fs, blocksize=self.block_size, latency="low",
                 channels=(self.in_total, self.out_total), dtype="float32",
                 callback=self._duplex_callback)
         else:
             self.stream = sd.InputStream(device=self.in_device,
-                samplerate=self.fs, blocksize=BLOCK_SIZE,
+                samplerate=self.fs, blocksize=self.block_size, latency="low",
                 channels=self.in_total, dtype="float32",
                 callback=self._input_only_callback)
         self.stream.start()
+        # Sürücünün fiilen sağladığı gecikmeyi oku (giriş+çıkış, gidiş-dönüş)
+        try:
+            lat = self.stream.latency
+            total = (lat[0] + lat[1]) if isinstance(lat, (tuple, list)) else float(lat)
+            self.latency_ms = round(total * 1000.0, 1)
+        except Exception:
+            self.latency_ms = None
 
     def stop(self):
         if self.stream: self.stream.stop(); self.stream.close(); self.stream = None
@@ -532,6 +621,7 @@ class App(tk.Tk):
         self.minsize(560, 680)
         self.engine = self.in_device = self.out_device = None
         self.in_total = self.out_total = 0
+        self.block_size = BLOCK_SIZE   # gecikme ayarı (ChannelFrame'de seçilir)
 
         # Boşta öğrenme motoru — uygulama açık kaldıkça çalışır
         self._learn_lbls = []
@@ -601,7 +691,8 @@ class App(tk.Tk):
         info = sd.query_devices(self.in_device)
         fs = int(info["default_samplerate"]) or SAMPLE_RATE_DEFAULT
         self.engine = AudioEngine(self.in_device, self.out_device, (start, end),
-                                  self.in_total, self.out_total, fs, self.update_status)
+                                  self.in_total, self.out_total, fs, self.update_status,
+                                  block_size=self.block_size)
         self.frame_main = MainFrame(self, self.engine)
         self.frame_main.pack(fill="both", expand=True)
 
@@ -714,6 +805,28 @@ class ChannelFrame(ttk.Frame):
         ttk.Label(frm, text="Bitiş:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
         self.end_var = tk.IntVar(value=min(2, max_ch))
         ttk.Spinbox(frm, from_=1, to=max_ch, textvariable=self.end_var, width=6).grid(row=1, column=1, padx=5)
+
+        # --- Gecikme (blok boyutu) seçimi ---
+        self.app = master
+        fs_guess = SAMPLE_RATE_DEFAULT
+        ttk.Label(frm, text="Gecikme:").grid(row=2, column=0, padx=5, pady=(14, 5), sticky="e")
+        self._bs_opts = [
+            ("En düşük — 64 örnek  (≈1.3 ms/blok)", 64),
+            ("Düşük — 128 örnek  (≈2.7 ms/blok)", 128),
+            ("Dengeli — 256 örnek  (≈5.3 ms/blok)", 256),
+            ("Güvenli — 512 örnek  (≈10.7 ms/blok)", 512),
+        ]
+        self.bs_cb = ttk.Combobox(frm, values=[o[0] for o in self._bs_opts],
+                                  state="readonly", width=34)
+        # mevcut app.block_size'a denk geleni seç
+        cur = next((i for i, o in enumerate(self._bs_opts) if o[1] == master.block_size), 1)
+        self.bs_cb.current(cur)
+        self.bs_cb.grid(row=2, column=1, padx=5, pady=(14, 5))
+        ttk.Label(self, text="Gerçek gecikme ses kartı sürücünüze bağlıdır; en düşük buffer "
+                             "için Windows'ta ASIO/WASAPI önerilir. BAŞLAT'tan sonra gerçek "
+                             "değer ekranda gösterilir.",
+                  wraplength=480, foreground="gray", justify="left").pack(anchor="w", pady=(6, 0))
+
         btns = ttk.Frame(self); btns.pack(pady=10)
         ttk.Button(btns, text="Geri", command=on_back).pack(side="left", padx=5)
         ttk.Button(btns, text="Devam", command=self._go).pack(side="left", padx=5)
@@ -723,6 +836,7 @@ class ChannelFrame(ttk.Frame):
         if s > e or s < 1: messagebox.showwarning("Uyarı", "Geçersiz aralık."); return
         if (e - s + 1) > 8:
             if not messagebox.askyesno("Onay", f"{e-s+1} kanal işlenecek, CPU yorabilir. Devam?"): return
+        self.app.block_size = self._bs_opts[self.bs_cb.current()][1]   # seçilen gecikme
         self.on_chosen(s, e)
 
 
@@ -745,6 +859,11 @@ class MainFrame(ttk.Frame):
                                      foreground="gray", wraplength=460, justify="center")
         self.profile_lbl.pack(pady=(2, 0))
 
+        # Gerçek gidiş-dönüş gecikmesi (sürücüden okunur, BAŞLAT'ta güncellenir)
+        self.latency_lbl = ttk.Label(self, text="Gecikme: — (BAŞLAT'a basın)",
+                                     foreground="#0a7", font=("", 10, "bold"))
+        self.latency_lbl.pack(pady=(6, 0))
+
         ttk.Label(self, text="Giriş Seviyesi").pack(pady=(15, 0))
         self.level_bar = ttk.Progressbar(self, orient="horizontal", length=300, mode="determinate", maximum=100)
         self.level_bar.pack(pady=5)
@@ -765,12 +884,21 @@ class MainFrame(ttk.Frame):
         ttk.Checkbutton(self, text="Feedback anlarını kaydet", variable=self.rec_var,
                         command=lambda: engine.set_recording(self.rec_var.get())).pack(pady=10)
 
-        self.start_btn = ttk.Button(self, text="BAŞLAT", command=self._toggle)
-        self.start_btn.pack(pady=15)
+        btnrow = ttk.Frame(self); btnrow.pack(pady=15)
+        self.start_btn = ttk.Button(btnrow, text="BAŞLAT", command=self._toggle)
+        self.start_btn.pack(side="left", padx=4)
+        # Latch'li notch'ları temizle (yeni mekan / yanlış notch)
+        ttk.Button(btnrow, text="Notch Sıfırla", command=self._reset_notches).pack(side="left", padx=4)
+
         self.status_lbl = ttk.Label(self, text="Durum: Beklemede", wraplength=400, justify="center")
         self.status_lbl.pack(pady=10)
         ttk.Button(self, text="< Cihazları Değiştir", command=self.app._back_from_main).pack(pady=5)
         self._on_wet(self.wet_var.get())
+
+    def _reset_notches(self):
+        if self.engine:
+            self.engine.reset_notches()
+            self.status_lbl.config(text="Notch'lar sıfırlandı.")
 
     def _on_wet(self, val):
         v = float(val)
@@ -784,6 +912,12 @@ class MainFrame(ttk.Frame):
                 self.engine.start(); self.running = True
                 self.start_btn.config(text="DURDUR")
                 self.status_lbl.config(text="Durum: Çalışıyor...")
+                lm = self.engine.get_latency_ms()
+                if lm is not None:
+                    col = "#0a7" if lm <= 10 else ("#c80" if lm <= 25 else "#c00")
+                    self.latency_lbl.config(text=f"Gerçek gecikme: {lm} ms (gidiş-dönüş)", foreground=col)
+                else:
+                    self.latency_lbl.config(text="Gecikme: sürücü bildirmedi")
                 self._poll()
             except Exception as e:
                 self.app.resume_learning()
