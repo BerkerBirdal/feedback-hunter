@@ -904,15 +904,24 @@ class ChannelFrame(ttk.Frame):
     def __init__(self, master, max_ch, on_chosen, on_back):
         super().__init__(master, padding=20)
         self.on_chosen = on_chosen
-        ttk.Label(self, text="2) Giriş Kanal Aralığı", font=("", 14, "bold")).pack(pady=(0, 10))
-        ttk.Label(self, text=f"{max_ch} kanal mevcut. İşlenecek aralığı seçin:").pack(anchor="w")
+        self.max_ch = max_ch
+        # Kullanıcıya SADECE "hangi kanal?" sorulur (aralık değil). Tek kanallı girişte otomatik.
+        self.single = max_ch <= 1
+
+        if self.single:
+            ttk.Label(self, text="2) Gecikme Ayarı", font=("", 14, "bold")).pack(pady=(0, 10))
+            ttk.Label(self, text="Tek kanallı giriş — otomatik seçildi.").pack(anchor="w")
+        else:
+            ttk.Label(self, text="2) Hangi Kanal?", font=("", 14, "bold")).pack(pady=(0, 10))
+            ttk.Label(self, text=f"{max_ch} kanallı giriş. Feedback avcısını hangi kanala uygulayalım?").pack(anchor="w")
+
         frm = ttk.Frame(self); frm.pack(pady=20)
-        ttk.Label(frm, text="Başlangıç:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
-        self.start_var = tk.IntVar(value=1)
-        ttk.Spinbox(frm, from_=1, to=max_ch, textvariable=self.start_var, width=6).grid(row=0, column=1, padx=5)
-        ttk.Label(frm, text="Bitiş:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
-        self.end_var = tk.IntVar(value=min(2, max_ch))
-        ttk.Spinbox(frm, from_=1, to=max_ch, textvariable=self.end_var, width=6).grid(row=1, column=1, padx=5)
+        if not self.single:
+            ttk.Label(frm, text="Kanal:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+            self.ch_cb = ttk.Combobox(frm, values=[f"Kanal {i}" for i in range(1, max_ch + 1)],
+                                      state="readonly", width=14)
+            self.ch_cb.current(0)
+            self.ch_cb.grid(row=0, column=1, padx=5, pady=5, sticky="w")
 
         # --- Gecikme (blok boyutu) seçimi ---
         self.app = master
@@ -940,12 +949,9 @@ class ChannelFrame(ttk.Frame):
         ttk.Button(btns, text="Devam", command=self._go).pack(side="left", padx=5)
 
     def _go(self):
-        s, e = self.start_var.get(), self.end_var.get()
-        if s > e or s < 1: messagebox.showwarning("Uyarı", "Geçersiz aralık."); return
-        if (e - s + 1) > 8:
-            if not messagebox.askyesno("Onay", f"{e-s+1} kanal işlenecek, CPU yorabilir. Devam?"): return
+        ch = 1 if self.single else (self.ch_cb.current() + 1)   # seçilen tek kanal
         self.app.block_size = self._bs_opts[self.bs_cb.current()][1]   # seçilen gecikme
-        self.on_chosen(s, e)
+        self.on_chosen(ch, ch)   # start=end=seçilen kanal → yalnız o kanala feedback avı
 
 
 class MainFrame(ttk.Frame):
