@@ -30,24 +30,26 @@ jobs:
           parts = (ver.split(".") + ["0","0","0","0"])[:4]
           parts = [re.sub(r"\D","",x) or "0" for x in parts]
           vtuple = ",".join(parts)
-          vf = f'''VSVersionInfo(
-  ffi=FixedFileInfo(
-    filevers=({vtuple}), prodvers=({vtuple}),
-    mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0,0)),
-  kids=[
-    StringFileInfo([StringTable('040904B0', [
-      StringStruct('CompanyName', 'Berker Birdal'),
-      StringStruct('FileDescription', 'Feedback Hunter - Canli Ses Anti-Feedback'),
-      StringStruct('FileVersion', '{ver}'),
-      StringStruct('InternalName', 'FeedbackHunter'),
-      StringStruct('LegalCopyright', '(c) 2026 Berker Birdal. Tum haklari saklidir.'),
-      StringStruct('OriginalFilename', 'FeedbackHunter.exe'),
-      StringStruct('ProductName', 'Feedback Hunter'),
-      StringStruct('ProductVersion', '{ver}')])]),
-    VarFileInfo([VarStruct('Translation', [1033, 1200])])
-  ]
-)'''
-          open("version_info.txt","w",encoding="utf-8").write(vf)
+          lines = [
+            "VSVersionInfo(",
+            "  ffi=FixedFileInfo(",
+            f"    filevers=({vtuple}), prodvers=({vtuple}),",
+            "    mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0,0)),",
+            "  kids=[",
+            "    StringFileInfo([StringTable('040904B0', [",
+            "      StringStruct('CompanyName', 'Berker Birdal'),",
+            "      StringStruct('FileDescription', 'Feedback Hunter - Canli Ses Anti-Feedback'),",
+            f"      StringStruct('FileVersion', '{ver}'),",
+            "      StringStruct('InternalName', 'FeedbackHunter'),",
+            "      StringStruct('LegalCopyright', '(c) 2026 Berker Birdal. Tum haklari saklidir.'),",
+            "      StringStruct('OriginalFilename', 'FeedbackHunter.exe'),",
+            "      StringStruct('ProductName', 'Feedback Hunter'),",
+            f"      StringStruct('ProductVersion', '{ver}')])]),",
+            "    VarFileInfo([VarStruct('Translation', [1033, 1200])])",
+            "  ]",
+            ")",
+          ]
+          open("version_info.txt","w",encoding="utf-8").write("\n".join(lines))
           print("version_info.txt yazildi:", vtuple)
 
       - name: Install dependencies
