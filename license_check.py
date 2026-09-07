@@ -16,6 +16,16 @@ OFFLINE_GRACE_SECONDS = 7 * 24 * 3600  # 7 gün
 APP_VERSION           = "0.1.0"
 
 
+_CREDS = {"u": "", "p": ""}
+
+def get_credentials():
+    """Giriş sonrası kimlik (bulut katkısı için). ('', '') = giriş yok."""
+    return _CREDS["u"], _CREDS["p"]
+
+def _set_credentials(u, p):
+    _CREDS["u"] = u or ""; _CREDS["p"] = p or ""
+
+
 def _cache_key(username, password):
     return hashlib.sha256(f"{username}:{password}".encode()).hexdigest()
 
@@ -201,6 +211,7 @@ class LoginDialog(tk.Tk):
         status = _verify_online(u, p)
         if status == "offline":
             if _check_cache(u, p):
+                self.username = u; self.password = p
                 self.result = True; self.destroy(); return
             self.status_lbl.config(text="Sunucuya ulaşılamıyor ve önbellek bulunamadı. "
                                         "İlk girişte internet gerekli.")
@@ -224,6 +235,7 @@ def require_login():
     dlg.mainloop()
     if not dlg.result:
         raise SystemExit(0)
+    _set_credentials(getattr(dlg, "username", ""), getattr(dlg, "password", ""))
     # giriş sonrası: yeni sürüm varsa uygulama içinden güncelleme sun (siteye gitmeden)
     try:
         maybe_offer_update(getattr(dlg, "username", ""), getattr(dlg, "password", ""))

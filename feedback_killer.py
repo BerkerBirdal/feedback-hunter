@@ -15,7 +15,7 @@ imzalı (dar bantlı, uzun süreli) tonları tespit edip mekan profiline
 from license_check import require_login
 require_login()
 
-import os, json, time, threading, datetime, subprocess, shutil
+import os, json, time, threading, datetime, subprocess, shutil, urllib.request
 import numpy as np
 import scipy.signal as sig
 import scipy.io.wavfile as wavfile
@@ -85,6 +85,84 @@ def save_venue_profile(profile):
 
 def freq_bucket(freq):
     return str(int(round(freq / PROFILE_BUCKET_HZ) * PROFILE_BUCKET_HZ))
+
+
+# ── Bulut kolektif öğrenme (crowd) — TOHUM lokal öğrenmeden AYRI tutulur ───────
+# global_seed.json: sunucudan gelen global önsel. Yalnız TESPİT için lokalle
+# birleşir; ASLA geri katkılanmaz (yankı/şişme olmasın). Ses sunucuya gitmez.
+SEED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "global_seed.json")
+CLOUD_SYNC_ENABLED = True
+
+def load_seed_profile():
+    try:
+        with open(SEED_PATH) as f: return json.load(f)
+    except Exception: return {}
+
+def save_seed_profile(seed):
+    try:
+        with open(SEED_PATH, "w") as f:
+            json.dump(seed, f, indent=2, sort_keys=True)
+    except Exception: pass
+
+def load_effective_profile():
+    """Canlı motor için: lokal öğrenme + global tohum (max-birleşim). Tespiti besler,
+    diske YAZILMAZ — böylece tohum katkı olarak geri gönderilmez."""
+    prof = dict(load_venue_profile())
+    for k, v in (load_seed_profile() or {}).items():
+        try: prof[k] = max(int(prof.get(k, 0)), int(v))
+        except Exception: pass
+    return prof
+
+def _cloud_sync():
+    """Arka plan (ses yoluna DOKUNMAZ, kısa timeout, offline'da sessiz):
+    1) cihazın SAF LOKAL öğrenmelerini anonim katkılar (yalnız frekans-kovası, ses YOK),
+    2) global önseli çekip global_seed.json'a yazar → yeni kurulum sıfırdan başlamaz."""
+    if not CLOUD_SYNC_ENABLED:
+        return
+    try:
+        import license_check as lc
+        base = lc.SERVER_URL.rstrip("/")
+    except Exception:
+        return
+    # 1) SAF LOKAL katkı (tohum HARİÇ — load_venue_profile tohumu içermez)
+    #    Throttle: aynı cihaz sık açılıp kapanınca kendi kovalarını şişirmesin (6 saat).
+    try:
+        u, p = lc.get_credentials()
+        local = load_venue_profile()
+        ts_path = SEED_PATH + ".synced"
+        last = 0.0
+        try:
+            with open(ts_path) as f: last = float(f.read().strip() or 0)
+        except Exception: last = 0.0
+        may_contribute = (time.time() - last) > 6 * 3600
+        if u and p and local and may_contribute:
+            buckets = {}
+            for k, v in local.items():
+                try: buckets[str(int(float(k)))] = int(v)
+                except Exception: pass
+            if buckets:
+                payload = json.dumps({"username": u, "password": p, "buckets": buckets}).encode()
+                req = urllib.request.Request(base + "/api/profile/contribute", data=payload,
+                        headers={"Content-Type": "application/json",
+                                 "User-Agent": "FeedbackHunter-sync"}, method="POST")
+                urllib.request.urlopen(req, timeout=6).read()
+                try:
+                    with open(ts_path, "w") as f: f.write(str(time.time()))
+                except Exception: pass
+    except Exception:
+        pass
+    # 2) global önseli çek → global_seed.json (lokal profili KİRLETMEZ)
+    try:
+        with urllib.request.urlopen(base + "/api/profile/global?limit=150", timeout=6) as r:
+            data = json.loads(r.read())
+        seed = {}
+        for k, v in (data.get("buckets") or {}).items():
+            try: seed[str(int(float(k)))] = int(v)
+            except Exception: pass
+        if seed:
+            save_seed_profile(seed)
+    except Exception:
+        pass
 
 
 # ── Ses/Video çözümleme (ffmpeg varsa her formatı, yoksa sadece WAV) ──────────
@@ -532,7 +610,7 @@ class AudioEngine:
         self.input_level_db    = -100.0
         self.output_level_db   = -100.0
         self._rec_buffer = []; self._rec_freqs = set(); self._rec_active = False
-        self.venue_profile = load_venue_profile()
+        self.venue_profile = load_effective_profile()   # lokal öğrenme + global tohum (tespit için)
         self.processors = [ChannelProcessor(self.fs, self.block_size, ANALYSIS_SIZE, profile=self.venue_profile)
                            for _ in range(self.n_channels)]
         self.stream = None
@@ -655,6 +733,9 @@ class App(tk.Tk):
         self.learner = IdleLearner(status_cb=self._learn_status)
         if self.learner.enabled and self.learner.library_dir:
             self.learner.start()
+
+        # Bulut kolektif öğrenme — arka planda (ses yoluna dokunmaz): katkı + global tohum
+        threading.Thread(target=_cloud_sync, daemon=True).start()
 
         self.frame_device = DeviceFrame(self, self.on_device_chosen)
         self.frame_channels = self.frame_main = None
