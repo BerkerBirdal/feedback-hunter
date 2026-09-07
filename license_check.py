@@ -6,7 +6,7 @@ Copyright (c) 2026 Berker Birdal. Tüm hakları saklıdır. / All Rights Reserve
 İzinsiz kopyalama, dağıtma ve değiştirme yasaktır. Bkz. LICENSE.
 """
 
-import os, json, time, hashlib, urllib.request, urllib.error
+import os, sys, json, time, hashlib, tempfile, subprocess, urllib.request, urllib.error
 import tkinter as tk
 from tkinter import ttk
 
@@ -36,47 +36,108 @@ def _check_cache(username, password):
     if data.get("key") != _cache_key(username, password): return False
     return (time.time() - data.get("ts", 0)) < OFFLINE_GRACE_SECONDS
 
-def _check_remote_control():
-    """Sunucudan kill switch ve versiyon kontrolü. False dönerse uygulama kapanmalı."""
+def _fetch_version_info():
+    """Sunucudan sürüm/kill-switch bilgisini çeker. Dict veya None döner."""
     try:
         url = f"{SERVER_URL}/api/version?v={APP_VERSION}"
         req = urllib.request.Request(url, headers={"User-Agent": f"FeedbackHunter/{APP_VERSION}"})
         with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-
-        if not data.get("active", True):
-            msg = data.get("message") or "Bu yazılımın lisansı iptal edilmiştir.\n\nBilgi: bossproankara@gmail.com"
-            import tkinter.messagebox as mb
-            root = tk.Tk(); root.withdraw()
-            mb.showerror("Feedback Hunter — Lisans İptal", msg)
-            root.destroy()
-            return False
-
-        latest = data.get("latest_version", APP_VERSION)
-        force  = data.get("force_update", True)   # varsayılan: sürüm farkı ZORUNLU güncelleme
-        if latest != APP_VERSION:
-            import tkinter.messagebox as mb
-            root = tk.Tk(); root.withdraw()
-            if force:
-                mb.showwarning(
-                    "Güncelleme Zorunlu",
-                    f"Feedback Hunter v{latest} güncelleme zorunludur.\n"
-                    f"Lütfen güncelleme yapın:\n{data.get('download_url', SERVER_URL)}"
-                )
-                root.destroy()
-                return False
-            else:
-                mb.showinfo(
-                    "Yeni Sürüm Mevcut",
-                    f"Feedback Hunter v{latest} yayında!\n"
-                    f"Güncellemek için: {data.get('download_url', SERVER_URL)}"
-                )
-            root.destroy()
-
+            return json.loads(resp.read())
     except Exception:
-        pass  # Sunucuya ulaşılamazsa devam et (offline kullanım)
+        return None  # offline: çağıran taraf devam etsin
 
+
+def _check_remote_control():
+    """Kill switch kontrolü (giriş ÖNCESİ, kimlik gerektirmez). False dönerse uygulama kapanmalı."""
+    data = _fetch_version_info()
+    if not data:
+        return True  # sunucuya ulaşılamazsa offline kullanıma izin ver
+    if not data.get("active", True):
+        msg = data.get("message") or "Bu yazılımın lisansı iptal edilmiştir.\n\nBilgi: bossproankara@gmail.com"
+        import tkinter.messagebox as mb
+        root = tk.Tk(); root.withdraw()
+        mb.showerror("Feedback Hunter — Lisans İptal", msg)
+        root.destroy()
+        return False
     return True
+
+
+def _platform_key():
+    return "windows" if sys.platform.startswith("win") else ("macos" if sys.platform == "darwin" else "other")
+
+
+def _download_and_run_update(username, password, parent=None):
+    """Yeni kurulum dosyasını auth'lu endpoint'ten indirip çalıştırır. Başarılıysa uygulamayı kapatır."""
+    import tkinter.messagebox as mb
+    plat = _platform_key()
+    suffix = ".exe" if plat == "windows" else (".dmg" if plat == "macos" else ".bin")
+    try:
+        payload = json.dumps({"username": username, "password": password, "platform": plat}).encode()
+        req = urllib.request.Request(
+            SERVER_URL.rstrip("/") + "/api/download", data=payload,
+            headers={"Content-Type": "application/json",
+                     "User-Agent": f"FeedbackHunter/{APP_VERSION}"}, method="POST",
+        )
+        fd, path = tempfile.mkstemp(suffix=suffix, prefix="FeedbackHunter-update-")
+        with urllib.request.urlopen(req, timeout=120) as resp, os.fdopen(fd, "wb") as out:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                out.write(chunk)
+    except Exception as e:
+        mb.showerror("Güncelleme Hatası",
+                     f"Güncelleme indirilemedi:\n{e}\n\nDaha sonra tekrar deneyin.", parent=parent)
+        return False
+
+    # İndirilen kurulumu başlat
+    try:
+        if plat == "windows":
+            os.startfile(path)                       # Inno Setup kurulumu açılır
+        elif plat == "macos":
+            subprocess.Popen(["open", path])         # DMG açılır
+        else:
+            mb.showinfo("Güncelleme", f"Kurulum indirildi:\n{path}", parent=parent)
+            return False
+    except Exception as e:
+        mb.showerror("Güncelleme Hatası", f"Kurulum başlatılamadı:\n{e}", parent=parent)
+        return False
+
+    mb.showinfo("Güncelleme",
+                "Güncelleme başlatıldı. Kurulumu tamamlayın; uygulama şimdi kapanacak.",
+                parent=parent)
+    raise SystemExit(0)
+
+
+def maybe_offer_update(username, password, parent=None):
+    """Giriş SONRASI: yeni sürüm varsa uygulama içinden güncelleme sunar (siteye gitmeden)."""
+    data = _fetch_version_info()
+    if not data:
+        return
+    latest = data.get("latest_version", APP_VERSION)
+    if latest == APP_VERSION:
+        return
+    force = data.get("force_update", False)
+    import tkinter.messagebox as mb
+    if force:
+        # Zorunlu: tek yol güncelleme; reddederse uygulama açılmaz
+        yes = mb.askokcancel(
+            "Güncelleme Zorunlu",
+            f"Feedback Hunter v{latest} zorunlu güncellemedir.\n\n"
+            f"'Tamam'a basınca güncelleme uygulama içinden indirilip kurulacak.",
+            parent=parent)
+        if not yes:
+            raise SystemExit(0)
+        _download_and_run_update(username, password, parent)
+        raise SystemExit(0)   # indirme başarısızsa da zorunlu sürümle devam etme
+    else:
+        yes = mb.askyesno(
+            "Yeni Sürüm Mevcut",
+            f"Feedback Hunter v{latest} yayında (sende v{APP_VERSION}).\n\n"
+            f"Şimdi güncellemek ister misin? (Uygulama içinden indirilir)",
+            parent=parent)
+        if yes:
+            _download_and_run_update(username, password, parent)
 
 
 def _verify_online(username, password):
@@ -145,7 +206,9 @@ class LoginDialog(tk.Tk):
                                         "İlk girişte internet gerekli.")
             return
         if status == "approved":
-            _save_cache(u, p); self.result = True; self.destroy()
+            _save_cache(u, p)
+            self.username = u; self.password = p
+            self.result = True; self.destroy()
         elif status == "pending":
             self.status_lbl.config(text="Hesabınız admin onayı bekliyor.")
         elif status == "rejected":
@@ -155,9 +218,16 @@ class LoginDialog(tk.Tk):
 
 
 def require_login():
-    if not _check_remote_control():
+    if not _check_remote_control():          # giriş öncesi: kill-switch
         raise SystemExit(0)
     dlg = LoginDialog()
     dlg.mainloop()
     if not dlg.result:
         raise SystemExit(0)
+    # giriş sonrası: yeni sürüm varsa uygulama içinden güncelleme sun (siteye gitmeden)
+    try:
+        maybe_offer_update(getattr(dlg, "username", ""), getattr(dlg, "password", ""))
+    except SystemExit:
+        raise
+    except Exception:
+        pass

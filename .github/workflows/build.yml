@@ -15,35 +15,70 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Inject version from tag
+      - name: Inject version from tag + write version_info.txt
         shell: python
         run: |
           import os, re
           ver = os.environ.get("GITHUB_REF_NAME", "0.0.0").lstrip("v")
+          # license_check.py APP_VERSION
           p = "license_check.py"
           s = open(p, encoding="utf-8").read()
           s = re.sub(r'APP_VERSION\s*=\s*"[^"]*"', f'APP_VERSION = "{ver}"', s)
           open(p, "w", encoding="utf-8").write(s)
           print("APP_VERSION =", ver)
+          # 4'lu sürüm tuple (Windows kaynak versiyonu)
+          parts = (ver.split(".") + ["0","0","0","0"])[:4]
+          parts = [re.sub(r"\D","",x) or "0" for x in parts]
+          vtuple = ",".join(parts)
+          vf = f'''VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=({vtuple}), prodvers=({vtuple}),
+    mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0,0)),
+  kids=[
+    StringFileInfo([StringTable('040904B0', [
+      StringStruct('CompanyName', 'Berker Birdal'),
+      StringStruct('FileDescription', 'Feedback Hunter - Canli Ses Anti-Feedback'),
+      StringStruct('FileVersion', '{ver}'),
+      StringStruct('InternalName', 'FeedbackHunter'),
+      StringStruct('LegalCopyright', '(c) 2026 Berker Birdal. Tum haklari saklidir.'),
+      StringStruct('OriginalFilename', 'FeedbackHunter.exe'),
+      StringStruct('ProductName', 'Feedback Hunter'),
+      StringStruct('ProductVersion', '{ver}')])]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)'''
+          open("version_info.txt","w",encoding="utf-8").write(vf)
+          print("version_info.txt yazildi:", vtuple)
 
       - name: Install dependencies
-        run: |
-          pip install sounddevice numpy scipy imageio-ffmpeg pyinstaller
+        run: pip install sounddevice numpy scipy imageio-ffmpeg pyinstaller
 
-      - name: Build exe
+      - name: Build exe (ikon + versiyon bilgisi)
         run: |
           pyinstaller --onefile --windowed --name FeedbackHunter `
+            --icon assets/icon.ico `
+            --version-file version_info.txt `
             --hidden-import sounddevice `
             --hidden-import scipy.signal `
             --hidden-import scipy.io.wavfile `
             --collect-all imageio_ffmpeg `
             feedback_killer.py
 
-      - name: Upload Windows artifact
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer (Inno Setup)
+        shell: cmd
+        run: |
+          set VER=%GITHUB_REF_NAME%
+          set VER=%VER:v=%
+          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=%VER% installer.iss
+
+      - name: Upload Windows installer
         uses: actions/upload-artifact@v4
         with:
-          name: feedback_hunter_windows
-          path: dist/FeedbackHunter.exe
+          name: feedback_hunter_windows_setup
+          path: installer_out/feedback_hunter_windows_setup.exe
 
   build-macos:
     runs-on: macos-latest
@@ -66,8 +101,7 @@ jobs:
           print("APP_VERSION =", ver)
 
       - name: Install dependencies
-        run: |
-          pip install sounddevice numpy scipy imageio-ffmpeg pyinstaller
+        run: pip install sounddevice numpy scipy imageio-ffmpeg pyinstaller
 
       - name: Build .app
         run: |

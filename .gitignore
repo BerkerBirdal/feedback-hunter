@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+dist/
+build/
+installer_out/
+version_info.txt
