@@ -814,12 +814,20 @@ class DeviceFrame(ttk.Frame):
         self.on_chosen = on_chosen
         self.app = master
         ttk.Label(self, text="1) Ses Kartı Seçimi", font=("", 14, "bold")).pack(pady=(0, 5))
+        self._dump_devices()
         self.in_devs  = self._list_devices(True)
         self.out_devs = self._list_devices(False)
         ttk.Label(self, text="Giriş cihazı:").pack(anchor="w", pady=(10, 0))
         self.in_cb = ttk.Combobox(self, values=[d[0] for d in self.in_devs], state="readonly", width=58)
-        if self.in_devs: self.in_cb.current(0)
+        if self.in_devs: self.in_cb.current(0)   # en çok kanal sunan cihaz (liste kanal sayısına göre sıralı)
         self.in_cb.pack(pady=5)
+        _maxin = self.in_devs[0][2] if self.in_devs else 0
+        ttk.Label(self,
+            text=(f"En çok kanal sunan cihaz seçildi ({_maxin} kanal). "
+                  "32 kanallı mikser için listede ASIO cihazını seç; ASIO görünmüyorsa "
+                  "mikserin ASIO sürücüsü (veya ASIO4ALL) kurulu olmalı — Windows'un "
+                  "MME/WASAPI paylaşımlı modu kanalları 2-8 ile sınırlar."),
+            wraplength=520, foreground="gray", justify="left", font=("", 9)).pack(anchor="w", pady=(2, 0))
         ttk.Label(self, text="Çıkış cihazı:").pack(anchor="w", pady=(10, 0))
         self.out_cb = ttk.Combobox(self, values=[d[0] for d in self.out_devs], state="readonly", width=58)
         def_idx = 0
@@ -882,14 +890,38 @@ class DeviceFrame(ttk.Frame):
             return
         self.app.learner.configure(d, enabled)
 
+    def _dump_devices(self):
+        """Tanı için: tüm cihaz + host API listesini exe yanına devices.txt olarak yazar."""
+        try:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "devices.txt")
+            apis = sd.query_hostapis()
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("Host API'ler: " + ", ".join(a["name"] for a in apis) + "\n\n")
+                for i, d in enumerate(sd.query_devices()):
+                    hi = d.get("hostapi", -1)
+                    api = apis[hi]["name"] if 0 <= hi < len(apis) else "?"
+                    f.write(f"[{i}] {d['name']}  ·  {api}  "
+                            f"in:{d['max_input_channels']} out:{d['max_output_channels']} "
+                            f"sr:{int(d.get('default_samplerate') or 0)}\n")
+        except Exception:
+            pass
+
     def _list_devices(self, inp):
+        """Tüm host API'lerdeki (ASIO/WASAPI/WDM-KS/MME...) cihazları host API + kanal sayısıyla
+        etiketler; en çok kanal sunan en üste. 32 kanallı mikser için ASIO girişi böyle görünür."""
         res = []
         try:
+            try: apis = sd.query_hostapis()
+            except Exception: apis = []
             for i, d in enumerate(sd.query_devices()):
-                if inp and d["max_input_channels"] > 0:
-                    res.append((f"{d['name']}  (in:{d['max_input_channels']})", i, d["max_input_channels"]))
-                elif not inp and d["max_output_channels"] > 0:
-                    res.append((f"{d['name']}  (out:{d['max_output_channels']})", i, d["max_output_channels"]))
+                ch = d["max_input_channels"] if inp else d["max_output_channels"]
+                if ch <= 0:
+                    continue
+                hi = d.get("hostapi", -1)
+                api = apis[hi]["name"] if 0 <= hi < len(apis) else "?"
+                tag = "in" if inp else "out"
+                res.append((f"{d['name']}  ·  {api}  ({tag}:{ch})", i, ch))
+            res.sort(key=lambda t: t[2], reverse=True)   # en çok kanal önce (32-kanal ASIO üstte)
         except Exception as e: messagebox.showerror("Hata", str(e))
         return res
 
