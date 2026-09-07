@@ -6,7 +6,7 @@ Copyright (c) 2026 Berker Birdal. Tüm hakları saklıdır. / All Rights Reserve
 İzinsiz kopyalama, dağıtma ve değiştirme yasaktır. Bkz. LICENSE.
 """
 
-import os, sys, json, time, hashlib, tempfile, subprocess, urllib.request, urllib.error
+import os, sys, json, time, hashlib, tempfile, threading, subprocess, urllib.request, urllib.error
 import tkinter as tk
 from tkinter import ttk
 
